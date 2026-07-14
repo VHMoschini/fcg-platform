@@ -134,14 +134,6 @@ Isso permite **scale out** seguro dos consumidores.
 
 ---
 
-## 5. Roteiro para o video (30 segundos de escalabilidade)
-
-1. `docker compose ps` — mostrar 3x `payments-api`
-2. RabbitMQ UI — fila com multiplos consumers
-3. `kubectl get pods` ou `kubectl get hpa` no K8s (se cluster ativo)
-
----
-
 ## Voltar ao modo normal (1 replica)
 
 ```powershell
