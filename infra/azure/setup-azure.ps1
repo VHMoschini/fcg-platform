@@ -5,39 +5,54 @@
 .DESCRIPTION
   1. Cria o resource group e aplica o main.bicep (ACR + AKS + Container Insights).
   2. Baixa as credenciais do cluster para o kubectl local.
-  3. Cria uma identidade para o GitHub Actions com federacao OIDC — sem client secret:
-     cada repositorio troca o token da propria execucao por um token da Azure.
-     Permissoes minimas: AcrPush no ACR, Cluster User no AKS, Reader no resource group.
+  3. Cria uma identidade gerenciada para o GitHub Actions com federacao OIDC — sem client secret:
+     as pipelines da branch main de cada repositorio trocam o token da propria execucao
+     por um token da Azure. Permissoes minimas: AcrPush no ACR, Cluster User no AKS,
+     Reader no resource group.
   4. Gera senhas aleatorias e grava tudo como GitHub Secrets / Variables nos repositorios.
+     As senhas so vao para o fcg-platform (e a pipeline dele que cria os Secrets do
+     Kubernetes); os repositorios dos servicos recebem apenas o acesso a Azure.
      As senhas tambem ficam em infra/azure/.secrets.local.json (fora do git) para voce
      consultar a senha do admin e do Grafana durante a demonstracao.
+
+  Assinaturas Azure for Students so aceitam algumas regioes; descubra quais com:
+    az policy assignment list --disable-scope-strict-match --query "[].parameters.listOfAllowedLocations.value" -o json
 
   Pre-requisitos: Azure CLI (az login feito), GitHub CLI (gh auth login feito) com
   permissao de admin nos repositorios, e PowerShell 7+.
 
 .EXAMPLE
   .\setup-azure.ps1
-  .\setup-azure.ps1 -Location brazilsouth -GithubOwner meu-usuario
+  .\setup-azure.ps1 -Location brazilsouth -GithubOwner outro-usuario
   .\setup-azure.ps1 -SkipGithub      # so a parte da Azure
+  .\setup-azure.ps1 -Monitoramento   # liga o Container Insights (cobra por GB de log)
 #>
 param(
     [string]$ResourceGroup = "rg-fcg",
-    [string]$Location = "eastus",
+    [string]$Location = "chilecentral",
     [string]$NomeBase = "fcg",
     [string]$GithubOwner = "VHMoschini",
+    # Container Insights cobra por GB de log ingerido. Desligado por padrao para poupar o
+    # credito do Azure for Students; os pods continuam visiveis no portal (AKS > Workloads).
+    [switch]$Monitoramento,
     [switch]$SkipGithub
 )
 
 $ErrorActionPreference = "Stop"
+# Faz az/gh/kubectl com exit code != 0 interromperem o script (PowerShell 7.3+), em vez
+# de seguir adiante com variaveis vazias.
+$PSNativeCommandUseErrorActionPreference = $true
 
-# Repositorio -> branch que dispara o deploy.
-$repos = [ordered]@{
-    "fcg-platform"               = "main"
-    "fcg-users-api"              = "main"
-    "fcg-catalog-api"            = "main"
-    "fcg-payments-api"           = "main"
-    "fcg-notifications-function" = "master"
-}
+# Uma pipeline por repositorio, todas fazendo deploy a partir da main.
+# (O fcg-notifications-api foi substituido pela funcao serverless e nao tem pipeline.)
+$repos = @(
+    "fcg-platform",
+    "fcg-users-api",
+    "fcg-catalog-api",
+    "fcg-payments-api",
+    "fcg-notifications-function"
+)
+$branch = "main"
 
 function Step($texto) { Write-Host ""; Write-Host ">> $texto" -ForegroundColor Cyan }
 
@@ -63,12 +78,17 @@ Step "Aplicando main.bicep (ACR + AKS). Leva de 5 a 10 minutos..."
 $deploy = az deployment group create `
     --resource-group $ResourceGroup `
     --template-file (Join-Path $PSScriptRoot "main.bicep") `
-    --parameters nomeBase=$NomeBase `
+    --parameters nomeBase=$NomeBase habilitarMonitoramento=$($Monitoramento.IsPresent.ToString().ToLower()) `
     --query properties.outputs | ConvertFrom-Json
 
 $acrName = $deploy.acrName.value
 $aksName = $deploy.aksName.value
 Write-Host "ACR: $acrName  |  AKS: $aksName" -ForegroundColor Green
+
+# O Bicep ja da AcrPull a identidade dos nos, mas a atribuicao pode nao propagar a tempo
+# (visto na assinatura Azure for Students: pull com 401). O attach-acr garante e e idempotente.
+Step "Permissao AcrPull dos nos do AKS no ACR"
+az aks update --resource-group $ResourceGroup --name $aksName --attach-acr $acrName --output none
 
 # ---------------------------------------------------------------- 2. kubectl
 Step "Credenciais do cluster para o kubectl"
@@ -82,32 +102,39 @@ if ($SkipGithub) {
 
 # ---------------------------------------------------------------- 3. OIDC
 Step "Identidade do GitHub Actions (OIDC, sem client secret)"
-$appName = "$NomeBase-github-actions"
-$appId = az ad app list --display-name $appName --query "[0].appId" -o tsv
-if (-not $appId) {
-    $appId = az ad app create --display-name $appName --query appId -o tsv
-}
-$spId = az ad sp list --filter "appId eq '$appId'" --query "[0].id" -o tsv
-if (-not $spId) {
-    $spId = az ad sp create --id $appId --query id -o tsv
-}
+# Identidade gerenciada (user-assigned) com credencial federada para o GitHub: o
+# azure/login troca o token OIDC da execucao por um token desta identidade. Criar a
+# identidade so exige permissao na assinatura (Azure RBAC), nao no Entra ID — funciona
+# tambem em contas de estudante/convidadas, que nao podem registrar aplicativos.
+$idName = "$NomeBase-github-actions"
+$identidade = az identity create --name $idName --resource-group $ResourceGroup --location $Location | ConvertFrom-Json
+$appId = $identidade.clientId
+$spId = $identidade.principalId
 
-$existentes = az ad app federated-credential list --id $appId --query "[].name" -o tsv
-foreach ($repo in $repos.Keys) {
-    $nome = "$repo-$($repos[$repo])"
-    if ($existentes -contains $nome) { continue }
-    $cred = @{
-        name      = $nome
-        issuer    = "https://token.actions.githubusercontent.com"
-        subject   = "repo:$GithubOwner/${repo}:ref:refs/heads/$($repos[$repo])"
-        audiences = @("api://AzureADTokenExchange")
-    } | ConvertTo-Json -Compress
-    $arquivo = New-TemporaryFile
-    Set-Content -Path $arquivo -Value $cred -Encoding utf8
-    az ad app federated-credential create --id $appId --parameters "@$arquivo" --output none
-    Remove-Item $arquivo
-    Write-Host "  federacao: $GithubOwner/$repo ($($repos[$repo]))"
+# O subject do token OIDC do GitHub pode vir em dois formatos, conforme a configuracao
+# do repositorio/organizacao: o classico (repo:dono/repo:ref:...) e o com IDs imutaveis
+# (repo:dono@<id>/repo@<id>:ref:...). Cria uma credencial federada para cada um, em cada
+# repositorio: 5 repositorios x 2 formatos = 10 (a Azure aceita ate 20 por identidade).
+$subjects = [ordered]@{}
+foreach ($repo in $repos) {
+    $repoInfo = gh api "repos/$GithubOwner/$repo" | ConvertFrom-Json
+    $subjects["$repo-$branch"]     = "repo:${GithubOwner}/${repo}:ref:refs/heads/$branch"
+    $subjects["$repo-$branch-ids"] = "repo:${GithubOwner}@$($repoInfo.owner.id)/${repo}@$($repoInfo.id):ref:refs/heads/$branch"
 }
+$existentes = az identity federated-credential list --identity-name $idName --resource-group $ResourceGroup --query "[].name" -o tsv
+foreach ($nome in $subjects.Keys) {
+    if ($existentes -notcontains $nome) {
+        az identity federated-credential create `
+            --name $nome `
+            --identity-name $idName `
+            --resource-group $ResourceGroup `
+            --issuer "https://token.actions.githubusercontent.com" `
+            --subject $subjects[$nome] `
+            --audiences "api://AzureADTokenExchange" `
+            --output none
+    }
+}
+Write-Host "  identidade: $idName  |  federacao: $($repos.Count) repositorios de $GithubOwner ($branch)"
 
 $rgId = az group show --name $ResourceGroup --query id -o tsv
 $acrId = az acr show --name $acrName --query id -o tsv
@@ -117,8 +144,18 @@ foreach ($atribuicao in @(
         @{ Role = "Reader"; Scope = $rgId },
         @{ Role = "AcrPush"; Scope = $acrId },
         @{ Role = "Azure Kubernetes Service Cluster User Role"; Scope = $aksId })) {
-    az role assignment create --assignee-object-id $spId --assignee-principal-type ServicePrincipal `
-        --role $atribuicao.Role --scope $atribuicao.Scope --output none 2>$null
+    # Identidade recem-criada pode levar alguns segundos para replicar: tenta ate 6 vezes.
+    $ok = $false
+    for ($tentativa = 1; $tentativa -le 6 -and -not $ok; $tentativa++) {
+        try {
+            az role assignment create --assignee-object-id $spId --assignee-principal-type ServicePrincipal `
+                --role $atribuicao.Role --scope $atribuicao.Scope --output none
+            $ok = $true
+        } catch {
+            if ($tentativa -eq 6) { throw }
+            Start-Sleep -Seconds 10
+        }
+    }
     Write-Host "  role: $($atribuicao.Role)"
 }
 
@@ -146,7 +183,7 @@ if (Test-Path $arquivoSenhas) {
 }
 
 Step "GitHub Secrets e Variables"
-foreach ($repo in $repos.Keys) {
+foreach ($repo in $repos) {
     $alvo = "$GithubOwner/$repo"
     gh secret set AZURE_CLIENT_ID       --repo $alvo --body $appId
     gh secret set AZURE_TENANT_ID       --repo $alvo --body $conta.tenantId
@@ -157,16 +194,17 @@ foreach ($repo in $repos.Keys) {
     Write-Host "  $alvo"
 }
 
-# As senhas so vao para o fcg-platform: e a pipeline dele que cria os Secrets do Kubernetes.
+# As senhas so vao para o fcg-platform: e a pipeline dele ("Platform deploy") que cria os
+# Secrets do Kubernetes.
 foreach ($nome in $senhas.Keys) {
     gh secret set $nome --repo "$GithubOwner/fcg-platform" --body $senhas[$nome]
 }
-Write-Host "  senhas gravadas em $GithubOwner/fcg-platform"
+Write-Host "  $($senhas.Count) senhas gravadas em $GithubOwner/fcg-platform"
 
 Write-Host ""
 Write-Host "Pronto. Proximos passos:" -ForegroundColor Green
-Write-Host "  1. Rode o workflow 'Platform deploy' no fcg-platform (Actions > Run workflow)."
-Write-Host "  2. Faca push (ou Run workflow) em cada API para publicar as imagens."
+Write-Host "  1. fcg-platform > Actions > 'Platform deploy' > Run workflow."
+Write-Host "  2. Em cada repositorio de servico > Actions > 'CI/CD - ...' > Run workflow (publica a imagem e faz o deploy)."
 Write-Host "  3. IP publico do gateway: kubectl get svc kong-proxy"
 Write-Host "  Admin da FCG: admin@fcg.local / $($senhas.SEED_ADMIN_PASSWORD)"
 Write-Host "  Grafana:      admin / $($senhas.GRAFANA_PASSWORD)  (kubectl port-forward svc/grafana 3000:3000)"

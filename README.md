@@ -128,7 +128,7 @@ fcg-platform/
 | Requisito | Escolha | Por quê |
 |---|---|---|
 | **Nuvem** | **Azure** | Mesma nuvem da função serverless da Fase 3 (Bicep, Function App). Um provedor só, uma identidade só |
-| **Kubernetes gerenciado** | **AKS**, plano Free, 2 nós `Standard_B2ms`, Azure CNI overlay | Control plane gerenciado sem custo; 8 GB por nó comportam Elasticsearch, bancos e APIs |
+| **Kubernetes gerenciado** | **AKS**, plano Free, 2 nós `Standard_B2as_v2`, Azure CNI overlay | Control plane gerenciado sem custo; 8 GB por nó comportam Elasticsearch, bancos e APIs. Na assinatura Azure for Students, Chile Central é a região permitida com cota para essa família de VM |
 | **Registry** | **ACR** Basic, `adminUserEnabled: false` | O AKS puxa as imagens pela identidade gerenciada (role `AcrPull`); a pipeline publica por OIDC (role `AcrPush`). Nenhuma senha de registry existe |
 | **Exposição** | **Service `type: LoadBalancer` no Kong** | O Kong já é o gateway (roteamento, JWT, rate limit); colocar um Ingress Controller na frente dele seria um segundo proxy fazendo o mesmo papel. O AKS provisiona o Azure Load Balancer e o IP público |
 | **IaC** | **Bicep** + manifestos K8s com **Kustomize** | Bicep é a linguagem nativa da Azure. Kustomize troca a imagem por commit sem template nem `sed` |
@@ -160,15 +160,22 @@ fcg-platform/
 
 ```powershell
 cd fcg-platform\infra\azure
-.\setup-azure.ps1                       # padrão: rg-fcg em eastus
+.\setup-azure.ps1                       # padrão: rg-fcg em chilecentral, sem Container Insights
 .\setup-azure.ps1 -Location brazilsouth # outra região
+.\setup-azure.ps1 -Monitoramento        # liga o Container Insights (cobra por GB de log)
+```
+
+Assinaturas **Azure for Students** só aceitam algumas regiões. Para ver quais:
+
+```powershell
+az policy assignment list --disable-scope-strict-match --query "[].parameters.listOfAllowedLocations.value" -o json
 ```
 
 O script:
 
-1. cria o resource group e aplica o [`main.bicep`](infra/azure/main.bicep) — ACR, AKS e Container Insights, mais a permissão `AcrPull` dos nós do AKS sobre o ACR;
+1. cria o resource group e aplica o [`main.bicep`](infra/azure/main.bicep) — ACR, AKS e (com `-Monitoramento`) Container Insights — e garante a permissão `AcrPull` dos nós do AKS sobre o ACR (`az aks update --attach-acr`);
 2. configura o `kubectl` local para o cluster;
-3. cria a identidade `fcg-github-actions` com **federated credentials** para cada repositório (`repo:VHMoschini/<repo>:ref:refs/heads/main`) e as roles mínimas: `AcrPush` no ACR, `Azure Kubernetes Service Cluster User Role` no AKS e `Reader` no resource group;
+3. cria a **identidade gerenciada** `fcg-github-actions` (user-assigned: não exige permissão de registrar aplicativos no Entra ID, o que contas de estudante não têm) com **federated credentials** para cada repositório (`repo:VHMoschini/<repo>:ref:refs/heads/main`) e as roles mínimas: `AcrPush` no ACR, `Azure Kubernetes Service Cluster User Role` no AKS e `Reader` no resource group;
 4. gera senhas aleatórias e grava os **GitHub Secrets e Variables** de todos os repositórios. As senhas ficam também em `infra/azure/.secrets.local.json` (no `.gitignore`) para consulta durante a demonstração.
 
 ### 2. Plataforma
@@ -491,7 +498,7 @@ Base: `http://<IP do kong-proxy>` (AKS), `http://localhost:8000` (compose) ou `h
 
 ## Custos e limpeza
 
-O cluster cobra por hora enquanto existir (2 VMs B2ms, discos, Load Balancer e IP público; o control plane do AKS no plano Free não é cobrado). Fora das gravações:
+O cluster cobra por hora enquanto existir (2 VMs B2as_v2, discos, Load Balancer e IP público; o control plane do AKS no plano Free não é cobrado). Fora das gravações:
 
 ```powershell
 az aks stop  --resource-group rg-fcg --name fcg-aks   # para os nós, mantém tudo
